@@ -8,8 +8,8 @@ Two choices apply to every query below:
 - **`reporter="source"`**: the latency is measured by the *caller's* sidecar. Istio injects the
   fault delay on the client side, so the destination sidecar inside shippingservice never sees it.
   With `reporter="destination"` the delay is invisible.
-- **Custom millisecond buckets**: Istio's default buckets are too coarse around 1s. Every
-  deployment in `kustomize/base/` sets this annotation:
+- **Custom millisecond buckets**: Istio reports latency in ms, so the buckets need to be in ms
+  too. Every deployment in [`../kustomize/base/`](../kustomize/base/) sets this annotation:
   ```yaml
   sidecar.istio.io/statsHistogramBuckets: |
     {"istiocustom":[0.1,0.2,0.5,1,5,10,50,100,150,200,250,300,400,500,600,700,800,900,1000,1500,2000,3000]}
@@ -47,10 +47,12 @@ histogram_quantile(0.99,
 )[30m:1m]
 ```
 
+Measured results (from the Lab 2 report):
+
 | State | frontend → shipping | checkout → shipping |
 |---|---|---|
-| Healthy | tens of ms | tens of ms |
-| `01-delay-checkout-to-shipping.yaml` applied | unchanged | **~1000 ms** |
+| Healthy | 2 ms | ≈3–4.7 ms |
+| `01-delay-checkout-to-shipping.yaml` applied | 2 ms (unchanged) | **≈995–998 ms** |
 
 ## 2. p99 checkout → shipping latency, split by checkoutservice pod
 
@@ -71,13 +73,17 @@ histogram_quantile(0.99,
 
 Add `[30m:1m]` for the per-minute table, as in query 1.
 
+Measured: **999 ms** for the labelled pod (`…-qhc9n`) and **≈8.3 ms** for the other replica (`…-xq89n`).
+
 ## 3. Grafana: histogram (Bar gauge) and heatmap
 
 Grafana draws the histogram itself, so drop the `histogram_quantile()` wrapper and any `[x:y]`
-subrange:
+subrange and give it the raw bucket rates.
+
+**Bar gauge histogram (both callers, delay on the checkout path):**
 
 ```promql
-sum by (le, source_canonical_service) (
+sum by (le) (
   rate(istio_request_duration_milliseconds_bucket{
     destination_canonical_service="shippingservice",
     source_canonical_service=~"checkoutservice|frontend",
@@ -86,13 +92,31 @@ sum by (le, source_canonical_service) (
 )
 ```
 
+Because the query sums over `le` only, both call paths go into one distribution, which ends up
+**bimodal**: undelayed calls pile up in the ~1 ms bucket and delayed checkout calls in the
+1000 ms / +Inf buckets. To draw each caller as its own histogram instead, use
+`sum by (le, source_canonical_service)`.
+
+**Heatmap (extra credit, calls from checkoutservice with one pod delayed):**
+
+```promql
+sum by (le) (
+  rate(istio_request_duration_milliseconds_bucket{
+    destination_canonical_service="shippingservice",
+    source_canonical_service="checkoutservice",
+    reporter="source"
+  }[5m])
+)
+```
+
 | Panel | Visualization | Format | Type |
 |---|---|---|---|
 | Latency histogram | **Bar gauge** | Heatmap | Instant |
-| Latency over time (extra credit) | **Heatmap** | Heatmap | Range |
+| Latency over time | **Heatmap** | Heatmap | Range |
 
-The heatmap panel uses the per-pod checkout → shipping series. While the single-pod delay is
-applied and removed, the chart switches between one latency band and two (~50 ms and ~1000 ms).
+*Format = Heatmap* tells Grafana to turn the cumulative `le` buckets into per-bucket counts. With
+the single-pod delay applied, the heatmap shows two bands (< 5 ms and ~1000 ms). After the rule
+is deleted, only the low band is left.
 
 The exported dashboard is in [`../grafana/shipping-latency-dashboard.json`](../grafana/shipping-latency-dashboard.json).
 
