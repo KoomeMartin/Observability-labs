@@ -1,0 +1,35 @@
+# Fault injection, part 2: delay calls from only ONE of two checkoutservice pods.
+#
+# 1. Scale out:   kubectl scale deploy checkoutservice --replicas=2
+# 2. Label one pod (either works):
+#      kubectl label pod <checkoutservice-pod> fault=delay
+#      kubectl edit pod <checkoutservice-pod>     # add `fault: delay` under metadata.labels
+# 3. Apply:       kubectl apply -f 02-delay-single-checkout-pod.yaml
+#
+# Only the labelled pod matches both sourceLabels, so only its calls to shippingservice
+# are delayed by 1s. The other replica and frontend use the default route.
+# Load is split evenly across the two pods, so the AVERAGE shipping latency seen in
+# Kiali is about 500ms. Prometheus `sum by (le, pod)` shows the two pods separately.
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: shippingservice
+spec:
+  hosts:
+  - shippingservice
+  http:
+  - match:
+    - sourceLabels:
+        app: "checkoutservice"
+        fault: "delay"
+    fault:
+      delay:
+        fixedDelay: 1s
+        percentage:
+          value: 100
+    route:
+    - destination:
+        host: shippingservice
+  - route:
+    - destination:
+        host: shippingservice

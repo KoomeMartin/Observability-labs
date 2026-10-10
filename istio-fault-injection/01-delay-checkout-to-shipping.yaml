@@ -1,0 +1,30 @@
+# Fault injection, part 1: delay only the checkoutservice -> shippingservice path.
+#
+# Every request that reaches shippingservice from a pod labelled app=checkoutservice
+# is held for 1s by the Envoy sidecar. Requests from frontend fall through to the
+# second (default) route and are not delayed.
+#
+#   kubectl apply  -f 01-delay-checkout-to-shipping.yaml
+#   kubectl delete -f 01-delay-checkout-to-shipping.yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: shippingservice
+spec:
+  hosts:
+  - shippingservice
+  http:
+  - match:
+    - sourceLabels:
+        app: "checkoutservice"
+    fault:
+      delay:
+        fixedDelay: 1s
+        percentage:
+          value: 100
+    route:
+    - destination:
+        host: shippingservice
+  - route:
+    - destination:
+        host: shippingservice
