@@ -1,0 +1,6 @@
+*.ipynb
+.ipynb_checkpoints
+__pycache__
+*_template*
+monitor_deploy.yaml
+monitor_all_deploy.yaml

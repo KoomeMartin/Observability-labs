@@ -13,13 +13,15 @@ microservices app on a self-managed **Kubernetes** cluster on an **Azure VM** an
 an **Istio** service mesh. I then used Istio to **inject latency faults**, first into one call
 path and then into **a single pod** of a scaled-out service. To detect and isolate those faults
 I used **Kiali**, **Prometheus** histogram queries and **Grafana** dashboards. The same metrics
-are pulled over the Prometheus API into a **Prophet** time-series model for anomaly detection.
+are pulled over the Prometheus API into **Prophet** time-series models. A containerised monitor
+running in the cluster uses them to flag anomalies and incidents for every service and publishes
+those flags back to Prometheus and Grafana.
 
 The labs come from *04-733 AIOps* (Carnegie Mellon University Africa, Fall 2026). The full lab
 reports are in [`reports/`](reports/).
 
-> **Status:** in progress. Kubernetes, Istio, Kiali, Prometheus and Grafana are done; the
-> anomaly-detection / AIOps part is still being built (see [Roadmap](#roadmap)).
+> **Status:** in progress. Kubernetes, Istio, Kiali, Prometheus, Grafana and the Prophet
+> anomaly/incident monitor are done; LLM-agent incident analysis is next (see [Roadmap](#roadmap)).
 
 ---
 
@@ -31,10 +33,13 @@ reports are in [`reports/`](reports/).
 | 1 s delay on the checkout → shipping path | p99 per caller | checkout **≈998 ms**, frontend **2 ms** (unchanged) |
 | 1 s delay on **one of two** checkout pods | p99 per pod | delayed pod **999 ms**, healthy pod **≈8.3 ms** |
 | Same fault, seen in Kiali (aggregate) | avg checkout → shipping | **≈500 ms**: the per-pod fault is averaged away |
+| 500 ms delay on **productcatalogservice** (leaf) | p95 per service, Prophet monitor | productcatalog **2.9 → 495 ms**, recommendation **9.9 → ≈555 ms**, frontend **50 → ≈4,830 ms**, checkout **53 → ≈1,000–3,000 ms**; incidents raised for all four; shipping, currency, payment, email and ad unaffected |
 
 **Main takeaway:** an aggregate dashboard can hide or blur a fault that affects only one
 replica. Grouping metrics by the right label (`source_canonical_service` for call paths, `pod`
-for replicas) and reading them from the **source** side lets you isolate it.
+for replicas) and reading them from the **source** side lets you isolate it. A delay in a leaf
+service spreads **up** the call graph: the per-service monitor flags every caller of the slow
+service and none of the others, which points straight at the root cause.
 
 ---
 
@@ -47,7 +52,8 @@ for replicas) and reading them from the **source** side lets you isolate it.
 - [Part 2: Fault injection observed in Kiali](#part-2-fault-injection-observed-in-kiali)
 - [Part 3: Measuring faults with Prometheus](#part-3-measuring-faults-with-prometheus)
 - [Part 4: Grafana dashboards](#part-4-grafana-dashboards)
-- [Part 5: Anomaly detection with Prophet (in progress)](#part-5-anomaly-detection-with-prophet-in-progress)
+- [Part 5: Anomaly detection with Prophet](#part-5-anomaly-detection-with-prophet)
+- [Part 6: Anomaly & incident monitor in the cluster](#part-6-anomaly--incident-monitor-in-the-cluster)
 - [Lessons learned](#lessons-learned)
 - [Reproduce it](#reproduce-it)
 - [Repository layout](#repository-layout)
@@ -62,7 +68,8 @@ for replicas) and reading them from the **source** side lets you isolate it.
 | **Kubernetes** | Single-node **kubeadm** cluster (containerd, **Calico** CNI) on Azure; deployed with **Kustomize**; `kubectl scale`; **rolling update** with a locally built image; live pod relabelling; resource requests/limits; `port-forward` access |
 | **Istio service mesh** | `istioctl` install, Gateway API CRDs, automatic **Envoy sidecar injection**; `VirtualService` routing with **fault injection** matched by source workload and by **one pod's label** |
 | **Observability** | **PromQL** on Istio histograms: `histogram_quantile`, `rate`, `sum by`, `[30m:1m]` subqueries; custom Envoy **histogram buckets**; Grafana **bar-gauge histograms** and **heatmaps**; Kiali traffic graphs and source/destination metrics |
-| **AIOps / analysis** | Prometheus **HTTP API** → pandas → **Prophet** forecast, flagging points outside the 95% band as anomalies |
+| **AIOps / analysis** | Prometheus **HTTP API** → pandas → **Prophet** (flat trend) per service; live anomaly check on single instant-query points; **incident = 4 consecutive anomalies**; flags published as a labelled Prometheus **Gauge** |
+| **Containers** | Dockerfile with `dumb-init`; image built with Docker and imported into the cluster's **containerd** (`ctr -n k8s.io images import`); `imagePullPolicy: Never`; Prometheus **scrape annotations** on the pod template |
 | **Communication** | Two written lab reports with annotated evidence ([`reports/`](reports/)) |
 
 ---
@@ -138,17 +145,21 @@ flowchart TB
         P1 & P2 & F & S -- "scrape istio_request_duration_milliseconds" --> PROM
         PROM --> GRAF
         PROM --> KIALI
+        PROM -- "HTTP API /api/v1/query<br/>(p95, last 1 min)" --> MON["monitordeploy pod<br/>Prophet monitor + Envoy"]
+        MON -- "scrape :8099/metrics<br/>lab3_anomalies_and_incidents" --> PROM
       end
     end
-    PROM -- "HTTP API /api/v1/query" --> NB["Jupyter + Prophet<br/>anomaly detection"]
+    PROM -- "HTTP API (training data)" --> NB["Jupyter + Prophet<br/>notebook"]
 ```
 
 1. `istiod` pushes the `VirtualService` to every sidecar. The **client-side** Envoy in the
    labelled checkout pod holds each matching request for 1 s before sending it.
 2. Every sidecar records request latency in the `istio_request_duration_milliseconds`
    histogram, which Prometheus scrapes.
-3. Kiali and Grafana read from Prometheus. The Prophet notebook pulls the same data over the
-   HTTP API.
+3. Kiali and Grafana read from Prometheus. The Prophet notebook and the training script pull
+   the same data over the HTTP API.
+4. The **monitor pod** asks Prometheus for the latest p95 per service every minute, scores it
+   with Prophet, and publishes `anomaly` / `incident` flags that Prometheus scrapes back.
 
 ---
 
@@ -349,18 +360,152 @@ A heatmap is the histogram turned on its side and repeated over time (*Visualiza
 
 ---
 
-## Part 5: Anomaly detection with Prophet (in progress)
+## Part 5: Anomaly detection with Prophet
 
 [`anomaly-detection/prophet_anomaly_detection.ipynb`](anomaly-detection/prophet_anomaly_detection.ipynb)
 
-1. **Collect:** query the Prometheus **HTTP API** (`/api/v1/query`) for the p95 shipping latency
-   over a `[1h:30s]` subquery and load the `[timestamp, value]` matrix into pandas.
+1. **Collect:** query the Prometheus **HTTP API** for the p95 shipping latency over a
+   `[12h:30s]` subquery and load the `[timestamp, value]` matrix into pandas.
 2. **Train:** fit a **Prophet** model on a healthy baseline
    ([`shipping_responsetime.json`](anomaly-detection/shipping_responsetime.json), shown below).
-3. **Detect:** predict over new data and flag every point above the 95% uncertainty interval
-   (`y > yhat_upper`), such as a spike caused by injected faults.
+   `growth='flat'` with all seasonality off gives a fixed flat trend, so the model can forecast
+   far into the future.
+3. **Detect:** run an *instant* query (no `[x:y]` subquery) to get a single value, wrap it in a
+   1-record dataframe, predict, and flag it when it is above the 95% interval (`y > yhat_upper`).
 
 <img src="docs/images/24-prophet-training-series.png" alt="Healthy p95 shipping latency used for training" width="500">
+
+### Single-service monitor
+
+[`anomaly-detection/monitor.py`](anomaly-detection/monitor.py) turns the notebook into a loop
+that runs every 60 s:
+
+```promql
+histogram_quantile( 0.95, sum by (le) (increase(istio_request_duration_milliseconds_bucket{
+    destination_canonical_service='shippingservice', reporter='source'}[1m])))
+```
+
+- Each cycle adds one row (`ds, y, yhat, yhat_lower, yhat_upper, anomaly, incident`) to a
+  dataframe and prints it.
+- **Incident** = the last **4** entries are all anomalies. A single slow minute raises `anomaly`
+  but not `incident`, and one normal minute clears the incident.
+- Both values are published as one Prometheus gauge with labels:
+
+```python
+g = Gauge('lab3_anomalies_and_incidents',
+          'Gauge for tracking anomalies and incidents across all services',
+          ["service", "kind"])
+g.labels(service_name, "anomaly").set(anomaly_count)          # 0 or 1
+g.labels(service_name, "incident").set(1 if anomaly_last4_count == 4 else 0)
+```
+
+Run it locally with `PROMETHEUS_URL=http://localhost:9090 python monitor.py` (the default is the
+in-cluster name `http://prometheus.istio-system:9090`).
+
+---
+
+## Part 6: Anomaly & incident monitor in the cluster
+
+### Deploying the monitor
+
+| File | Purpose |
+|---|---|
+| [`Dockerfile`](anomaly-detection/Dockerfile) / [`monitor_deploy.yaml`](anomaly-detection/monitor_deploy.yaml) | Single-service (shipping) monitor |
+| [`Dockerfile.all`](anomaly-detection/Dockerfile.all) / [`monitor_all_deploy.yaml`](anomaly-detection/monitor_all_deploy.yaml) | All-services monitor (the one running now) |
+| [`requirements.txt`](anomaly-detection/requirements.txt) | Pinned Prophet / pandas / prometheus_client versions |
+
+The training data is copied into the image, so the models are trained at startup. The pod
+template carries the Prometheus scrape annotations; Istio's metrics merging then serves the
+monitor's metrics through the sidecar (port 15020), and the pod runs `2/2` like every Boutique
+service.
+
+```yaml
+  template:
+    metadata:
+      labels:
+        app: monitor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8099"
+        prometheus.io/path: "/metrics"
+        proxy.istio.io/config: '{ "holdApplicationUntilProxyStarts": true }'
+```
+
+The cluster runs on **containerd**, which can't see images built by Docker, so the image is
+imported before deploying:
+
+```bash
+cd anomaly-detection
+docker build -f Dockerfile.all -t monitor-all:latest .
+docker save monitor-all:latest | sudo ctr -n k8s.io images import --platform linux/amd64 -
+kubectl apply -f monitor_all_deploy.yaml
+kubectl logs -f deploy/monitordeploy -c monitorcontainer
+```
+
+### Monitoring every service
+
+- [`fetch_training_data.py`](anomaly-detection/fetch_training_data.py) pulls 24 h of p95 history
+  for all 10 HTTP/gRPC services into
+  [`training_data/`](anomaly-detection/training_data/). The window is chosen to end **before**
+  any fault injection (`--end "2026-10-15 12:00"`), so the models learn only normal behaviour.
+  (`redis-cart` speaks plain TCP and has no request-duration histogram.)
+- [`monitor_all.py`](anomaly-detection/monitor_all.py) trains one Prophet model per service. Each
+  cycle, a single instant query grouped `by (le, destination_canonical_service)` returns the
+  latest p95 for every service at once. Every service has its own anomaly history and its own
+  `service` label on the gauge, and the console prints one summary table:
+
+```
+=== 2026-10-15 14:18:56  anomalies=5  incidents=3 ['frontend', 'productcatalogservice', 'recommendationservice'] ===
+                             y   yhat  yhat_upper  anomaly  last4  incident
+service
+adservice                 4.24   4.17        5.03        0      0         0
+cartservice               6.35   5.07        6.24        1      1         0
+checkoutservice        1925.00  52.58       88.35        1      2         0
+currencyservice           4.24   4.01        4.46        0      0         0
+emailservice              4.70   5.13       11.17        0      0         0
+frontend               4832.55  49.55       57.09        1      4         1
+paymentservice            0.98   3.80        8.32        0      0         0
+productcatalogservice   495.23   2.85        3.80        1      4         1
+recommendationservice   556.67   9.90       14.55        1      4         1
+shippingservice           3.80   3.37        5.35        0      0         0
+```
+
+### Fault in a leaf service spreads up the call graph
+
+[`istio-fault-injection/03-delay-productcatalog.yaml`](istio-fault-injection/03-delay-productcatalog.yaml)
+adds 500 ms to **every** call to productcatalogservice. Within about 5 minutes, incidents were
+raised for productcatalog itself and for all of its callers. Frontend reached ~4.8 s because a
+single page load calls productcatalog many times:
+
+```mermaid
+flowchart BT
+    PC["productcatalogservice<br/>2.9 → 495 ms<br/><b>INCIDENT</b>"]:::bad
+    REC["recommendationservice<br/>9.9 → ≈555 ms<br/><b>INCIDENT</b>"]:::bad
+    CO["checkoutservice<br/>53 → 1,000–3,000 ms<br/><b>INCIDENT</b> (intermittent)"]:::bad
+    FE["frontend<br/>50 → ≈4,830 ms<br/><b>INCIDENT</b>"]:::bad
+    OK["shipping · currency · payment · email · ad<br/>normal"]:::ok
+    PC --> REC --> FE
+    PC --> CO --> FE
+    PC --> FE
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#000;
+    classDef ok fill:#bbf7d0,stroke:#15803d,color:#000;
+```
+
+Checkout's incident flickered: with pages taking ~5 s, the load generator completed so few orders
+that some minutes had **no checkout requests at all** (`NaN` p95). A minute with no data is
+counted as "not an anomaly", which breaks the 4-in-a-row streak.
+
+### Grafana
+
+Two exported dashboards (*Dashboards → New → Import*):
+
+- [`grafana/lab3-anomaly-monitor-dashboard.json`](grafana/lab3-anomaly-monitor-dashboard.json):
+  shipping response-time heatmap, p95 time series, and anomaly / incident flags as time series
+  plus gauges.
+- [`grafana/lab3-all-services-dashboard.json`](grafana/lab3-all-services-dashboard.json):
+  summary state timelines and a table of anomaly / incident flags for **all** services, every
+  service's p95 on one log-scale chart, and detail rows (heatmap, p95, flags) for shipping,
+  checkout and frontend.
 
 ---
 
@@ -375,6 +520,11 @@ A heatmap is the histogram turned on its side and repeated over time (*Visualiza
 | HTTP 500s after a few page views | Tight CPU/memory limits (e.g. cartservice) | Raised requests/limits in the manifests |
 | Grafana showed a time series, not a histogram | Default panel options | Bar gauge + Format *Heatmap* + Type *Instant* |
 | `istio-gateway` stuck at `PROGRAMMED=False` | No cloud LoadBalancer on a bare VM | Reach the app with `kubectl port-forward` |
+| Locally built monitor image not found by the pod | Docker's image store is separate from the containerd `k8s.io` namespace that Kubernetes uses | `docker save … \| sudo ctr -n k8s.io images import -` and `imagePullPolicy: Never` |
+| Training on "the last 12 h" would have learned the faults | Fault-injection runs were inside the window | Train on a fixed window that ends before any fault (`fetch_training_data.py --end`) |
+| Burst of anomalies right after redeploying the monitor | Image import and training 10 models on a 4-CPU node slowed the whole app for a minute | Real transient; the 4-in-a-row incident rule filters it out |
+| Checkout incident kept dropping during the productcatalog fault | Some minutes had no checkout requests, so p95 was `NaN` and counted as normal | Expected with low-traffic services; skipping empty minutes would keep the streak |
+| No output in `kubectl logs` | Python buffers stdout when it isn't a terminal | `print(..., flush=True)` and `PYTHONUNBUFFERED=1` |
 
 ---
 
@@ -406,8 +556,20 @@ kubectl scale deploy checkoutservice --replicas=2
 kubectl label pod <checkout-pod> fault=delay
 kubectl apply -f istio-fault-injection/02-delay-single-checkout-pod.yaml
 
+# 5. Anomaly / incident monitor for all services
+cd anomaly-detection
+python fetch_training_data.py --end "YYYY-MM-DD HH:MM"   # end before any fault injection
+docker build -f Dockerfile.all -t monitor-all:latest .
+docker save monitor-all:latest | sudo ctr -n k8s.io images import --platform linux/amd64 -
+kubectl apply -f monitor_all_deploy.yaml
+kubectl logs -f deploy/monitordeploy -c monitorcontainer
+cd ..
+
+# 6. Fault: leaf service (all callers of productcatalog)
+kubectl apply -f istio-fault-injection/03-delay-productcatalog.yaml
+
 # Clean up
-kubectl delete virtualservice shippingservice
+kubectl delete virtualservice shippingservice productcatalogservice
 kubectl scale deploy checkoutservice --replicas=1
 ```
 
@@ -422,10 +584,17 @@ kubectl scale deploy checkoutservice --replicas=1
 │   ├── kustomization.yaml           ← service-mesh-istio component enabled
 │   ├── base/*.yaml                  ← Deployments with ms histogram buckets + tuned resources
 │   └── components/service-mesh-istio/
-├── istio-fault-injection/           ← VirtualService delay rules (path-level, pod-level)
+├── istio-fault-injection/           ← VirtualService delay rules (path, pod, leaf service)
 ├── promql/queries.md                ← every PromQL query, with explanations
-├── grafana/                         ← exported dashboard (bar gauge + heatmap)
-├── anomaly-detection/               ← Prophet notebook + sample Prometheus API data
+├── grafana/                         ← exported dashboards (histograms, anomaly monitors)
+├── anomaly-detection/
+│   ├── prophet_anomaly_detection.ipynb
+│   ├── monitor.py                   ← single-service monitor (shipping)
+│   ├── monitor_all.py               ← all-services monitor
+│   ├── fetch_training_data.py       ← pulls training data for every service
+│   ├── training_data/               ← 24 h healthy p95 per service
+│   ├── Dockerfile, Dockerfile.all, requirements.txt
+│   └── monitor_deploy.yaml, monitor_all_deploy.yaml
 ├── reports/                         ← full lab reports (PDF)
 └── docs/images/                     ← screenshots used in this README
 ```
@@ -438,8 +607,11 @@ kubectl scale deploy checkoutservice --replicas=1
 - [x] Rolling update with a locally built frontend image
 - [x] Kiali service graph; Istio fault injection by caller and by single pod
 - [x] Prometheus histogram queries; Grafana histogram + heatmap dashboards
-- [ ] Prophet anomaly detection on live fault-injection runs (in progress)
-- [ ] Richer frontend logging for LLM-agent-based incident analysis (AIOps)
+- [x] Prophet anomaly detection, single service then all services
+- [x] Monitor deployed in the cluster; anomaly / incident gauges in Prometheus and Grafana
+- [x] Leaf-service fault traced up the call graph by the monitor
+- [ ] LLM agents that investigate when an `incident` flag is raised (AIOps)
+- [ ] Richer frontend logging for LLM-agent-based incident analysis
 - [ ] Prometheus alerting rules on the p99 latency queries
 - [ ] Grafana dashboards provisioned as code (ConfigMap)
 

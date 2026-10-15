@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+# metadata are assigned to the Deployment itself
+metadata:
+  name: monitordeploy
+  namespace: default
+  labels:
+    app: monitor
+# the spec controls running pods and provides a template for new pods
+spec:
+  # for running pods, how many to keep running
+  replicas: 1
+  # how to find the set of pods to control
+  selector:
+    matchLabels:
+      app: monitor
+  # the template for creating new pods
+  template:
+    # these metadata go on the pods, and are used above by the deployment to control them...hence must match!
+    metadata:
+      labels:
+        app: monitor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8099"
+        prometheus.io/path: "/metrics"
+        # start the Istio sidecar before the monitor so its first Prometheus query succeeds
+        proxy.istio.io/config: '{ "holdApplicationUntilProxyStarts": true }'
+    # this spec is how to build the container for each pod, its image, resources, and port assignments
+    spec:
+      containers:
+      - name: monitorcontainer
+        imagePullPolicy: Never
+        image: monitor-all:latest
+        env:
+        # internal cluster name for Prometheus (not localhost)
+        - name: PROMETHEUS_URL
+          value: "http://prometheus.istio-system:9090"
+        - name: POLL_INTERVAL
+          value: "60"
+        - name: METRICS_PORT
+          value: "8099"
+        ports:
+        - name: http-metrics
+          containerPort: 8099
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            memory: 1Gi

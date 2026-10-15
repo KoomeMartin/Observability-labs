@@ -1,0 +1,22 @@
+# Delay EVERY call to productcatalogservice (a leaf service) by 500ms.
+# Callers: frontend, checkoutservice, recommendationservice - their own
+# response times rise too, so the monitor should flag them as well.
+#   apply:   kubectl apply  -f istio-fault-injection/03-delay-productcatalog.yaml
+#   remove:  kubectl delete -f istio-fault-injection/03-delay-productcatalog.yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: productcatalogservice
+  namespace: default
+spec:
+  hosts:
+  - productcatalogservice
+  http:
+  - fault:
+      delay:
+        fixedDelay: 500ms
+        percentage:
+          value: 100
+    route:
+    - destination:
+        host: productcatalogservice
