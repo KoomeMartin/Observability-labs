@@ -362,7 +362,8 @@ A heatmap is the histogram turned on its side and repeated over time (*Visualiza
 
 ## Part 5: Anomaly detection with Prophet
 
-[`anomaly-detection/prophet_anomaly_detection.ipynb`](anomaly-detection/prophet_anomaly_detection.ipynb)
+[`anomaly-detection/prophet_anomaly_detection.ipynb`](anomaly-detection/prophet_anomaly_detection.ipynb) ·
+full write-up: [Lab 3 report](reports/Lab3_Real-Time%20Anomaly%20Detection%20with%20Prophet%20and%20Istio%20Metrics.pdf)
 
 1. **Collect:** query the Prometheus **HTTP API** for the p95 shipping latency over a
    `[12h:30s]` subquery and load the `[timestamp, value]` matrix into pandas.
@@ -374,6 +375,13 @@ A heatmap is the histogram turned on its side and repeated over time (*Visualiza
    1-record dataframe, predict, and flag it when it is above the 95% interval (`y > yhat_upper`).
 
 <img src="docs/images/24-prophet-training-series.png" alt="Healthy p95 shipping latency used for training" width="500">
+
+| Scoring a range of new points: 2 of 120 above `yhat_upper` | Scoring one live point (instant query): within the band |
+|---|---|
+| <img src="docs/images/Week%201%20Task%201%20Anomally%20results%20Notebook.png" width="440"> | <img src="docs/images/Week%201%20Task%201%20Anomally%20results%20Notebook%20%28one%20Data%20point%29.png" width="440"> |
+
+The flat trend gives the same `yhat ≈ 3.25 ms` for every timestamp, days after the training
+window ended. Only the uncertainty band changes from point to point.
 
 ### Single-service monitor
 
@@ -401,6 +409,18 @@ g.labels(service_name, "incident").set(1 if anomaly_last4_count == 4 else 0)
 
 Run it locally with `PROMETHEUS_URL=http://localhost:9090 python monitor.py` (the default is the
 in-cluster name `http://prometheus.istio-system:9090`).
+
+**Healthy traffic:** every minute stays inside the band (≈1–5 ms), so there are no anomalies.
+
+<img src="docs/images/Week%201%20Task%202%20Anomally%20Console%20output%20%28no%20Injected%20Delays%29.png" alt="Monitor console, no delay: anomaly=0 every cycle" width="800">
+
+**With the 1 s checkout → shipping delay:** p95 jumps to ≈975 ms. `anomaly=1` from the first
+cycle, `last4` counts up 1 → 4, and `incident=1` on the **4th** consecutive anomaly. When the rule
+is deleted, the first normal minute (4.05 ms) resets both flags to 0.
+
+| Delay applied: incident on the 4th minute | Delay removed: flags clear on the first normal minute |
+|---|---|
+| <img src="docs/images/Week%201%20Task%203Anomally%20Console%20output%20%28With%20Injected%20Delays%29%20Part%201.png" width="440"> | <img src="docs/images/Week%201%20Task%203Anomally%20Console%20output%20%28With%20Injected%20Delays%29%20Part%202.png" width="440"> |
 
 ---
 
@@ -441,6 +461,18 @@ docker save monitor-all:latest | sudo ctr -n k8s.io images import --platform lin
 kubectl apply -f monitor_all_deploy.yaml
 kubectl logs -f deploy/monitordeploy -c monitorcontainer
 ```
+
+The same console output, now streamed from the `monitorcontainer` of the pod (viewed in k9s):
+
+<img src="docs/images/Week%202%20Task%201%20Monitor%20running%20in%20the%20cluster.png" alt="k9s logs of the monitor pod running in the cluster" width="800">
+
+**Single-service dashboard.** With the shipping delay applied, the p95 panel jumps to ≈1 s and
+the heatmap grows a second band at ~1 s. The anomaly gauge goes to 1 straight away, and the
+incident gauge follows four minutes later:
+
+| Delay just applied: anomaly = 1, incident = 0 | 4 minutes later: anomaly = 1, incident = 1 |
+|---|---|
+| <img src="docs/images/Week%202%20Task%201%20Grafana%20Visualization.png" width="440"> | <img src="docs/images/Week%202%20Task%201%20Grafana%20Visualization%20Part%202.png" width="440"> |
 
 ### Monitoring every service
 
@@ -495,9 +527,23 @@ Checkout's incident flickered: with pages taking ~5 s, the load generator comple
 that some minutes had **no checkout requests at all** (`NaN` p95). A minute with no data is
 counted as "not an anomaly", which breaks the 4-in-a-row streak.
 
+**All-services dashboard.** The window covers both experiments: first the shipping delay (only
+shipping and checkout turn red), then the productcatalog delay. The table on the left shows the
+current flags: productcatalog, recommendation, frontend and checkout are in an incident, and
+everything else is green. On the right, the per-service p95 chart (log scale) shows
+productcatalog stepping up to 495 ms and frontend climbing to ≈4.9 s.
+
+<img src="docs/images/Week%202%20Task%202%20Monitoring%20All%20services%201.png" alt="All-services dashboard: summary flags, current table and p95 per service" width="900">
+
+The detail rows show the same two faults service by service. Shipping is slow only during the
+shipping delay. Checkout is slow during **both**, because it calls shipping and productcatalog.
+Frontend reacts mostly to the productcatalog delay:
+
+<img src="docs/images/Week%202%20Task%202%20Monitoring%20All%20services%202.png" alt="Detail rows for shipping, checkout and frontend" width="900">
+
 ### Grafana
 
-Two exported dashboards (*Dashboards → New → Import*):
+The screenshots above come from two exported dashboards (*Dashboards → New → Import*):
 
 - [`grafana/lab3-anomaly-monitor-dashboard.json`](grafana/lab3-anomaly-monitor-dashboard.json):
   shipping response-time heatmap, p95 time series, and anomaly / incident flags as time series
@@ -595,7 +641,7 @@ kubectl scale deploy checkoutservice --replicas=1
 │   ├── training_data/               ← 24 h healthy p95 per service
 │   ├── Dockerfile, Dockerfile.all, requirements.txt
 │   └── monitor_deploy.yaml, monitor_all_deploy.yaml
-├── reports/                         ← full lab reports (PDF)
+├── reports/                         ← full lab reports (PDF), Labs 1–3
 └── docs/images/                     ← screenshots used in this README
 ```
 
